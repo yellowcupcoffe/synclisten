@@ -1,8 +1,7 @@
 import { io } from "socket.io-client";
 
 // In production, set VITE_SERVER_URL to your Render backend URL
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3001";
-
+const SERVER_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
 const socket = io(SERVER_URL, {
   autoConnect: true,
   reconnection: true,
