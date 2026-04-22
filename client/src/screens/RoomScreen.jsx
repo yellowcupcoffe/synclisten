@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import socket from "../socket";
 import Player from "../components/Player";
+import ChatPanel from "../components/ChatPanel";
 import {
   extractVideoId,
   fetchVideoInfo,
@@ -11,16 +12,21 @@ import {
 export default function RoomScreen({ userName, roomCode, onLeave }) {
   /* ─── State ──────────────────────────────────── */
   const [roomState, setRoomState] = useState(null);
-  const [activeTab, setActiveTab] = useState("playing"); // 'playing' | 'queue'
+  const [activeTab, setActiveTab] = useState("playing"); // 'playing' | 'queue' | 'chat'
   const [songUrl, setSongUrl] = useState("");
   const [isAddingSong, setIsAddingSong] = useState(false);
   const [playerTime, setPlayerTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [showChatDesktop, setShowChatDesktop] = useState(false);
 
   const playerRef = useRef(null);
   const lastVideoIdRef = useRef(null);
   const syncLockRef = useRef(false); // prevent sync loops
+  const isLoadingVideoRef = useRef(false); // audio fix: guard during video load
+  const syncTimeoutRef = useRef(null); // audio fix: debounce sync
 
   /* ─── Derived ────────────────────────────────── */
   const currentSong = roomState?.currentSong || null;
@@ -34,17 +40,33 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
   useEffect(() => {
     const handleRoomState = (state) => {
       setRoomState(state);
+      // Load initial messages from room state (for late joiners)
+      if (state.messages && chatMessages.length === 0) {
+        setChatMessages(state.messages);
+      }
+    };
+
+    const handleNewMessage = (msg) => {
+      setChatMessages((prev) => [...prev, msg]);
+      // Count unread if not on chat tab (mobile) or chat panel closed (desktop)
+      if (activeTab !== "chat" && !showChatDesktop) {
+        setUnreadCount((c) => c + 1);
+      }
     };
 
     socket.on("room-state", handleRoomState);
+    socket.on("new-message", handleNewMessage);
     return () => {
       socket.off("room-state", handleRoomState);
+      socket.off("new-message", handleNewMessage);
     };
-  }, []);
+  }, [activeTab, showChatDesktop]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ─── Sync player with server state ──────────── */
+  /* ─── Sync player with server state (FIXED) ──── */
   useEffect(() => {
     if (!roomState || !playerRef.current || syncLockRef.current) return;
+    // Audio fix: skip sync while a video is still loading/buffering
+    if (isLoadingVideoRef.current) return;
 
     const player = playerRef.current;
     const serverVideoId = currentSong?.videoId;
@@ -55,16 +77,21 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
     if (serverVideoId && serverVideoId !== lastVideoIdRef.current) {
       lastVideoIdRef.current = serverVideoId;
       syncLockRef.current = true;
+      isLoadingVideoRef.current = true; // Audio fix: lock sync during load
       player.loadVideo(serverVideoId, serverTime);
-      // Give the player time to load, then play/pause
-      setTimeout(() => {
+
+      // The onStateChange handler will unlock when PLAYING (state=1)
+      // Fallback timeout in case onStateChange never fires PLAYING
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      syncTimeoutRef.current = setTimeout(() => {
+        isLoadingVideoRef.current = false;
+        syncLockRef.current = false;
         if (serverPlaying) {
           player.play();
         } else {
           player.pause();
         }
-        syncLockRef.current = false;
-      }, 1000);
+      }, 5000);
       return;
     }
 
@@ -74,21 +101,29 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
       return;
     }
 
-    // Same video: sync play state
-    const localState = player.getState();
-    const isLocallyPlaying = localState === 1; // 1 = PLAYING
+    // Same video: sync play state (debounced to avoid thrashing)
+    if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+    syncTimeoutRef.current = setTimeout(() => {
+      const localState = player.getState();
+      const isLocallyPlaying = localState === 1; // 1 = PLAYING
 
-    if (serverPlaying && !isLocallyPlaying) {
-      player.play();
-    } else if (!serverPlaying && isLocallyPlaying) {
-      player.pause();
-    }
+      if (serverPlaying && !isLocallyPlaying && localState !== 3) {
+        // Don't call play() if currently buffering (state 3)
+        player.play();
+      } else if (!serverPlaying && isLocallyPlaying) {
+        player.pause();
+      }
 
-    // Sync time (only if drift > 2s)
-    const localTime = player.getCurrentTime();
-    if (Math.abs(localTime - serverTime) > 2) {
-      player.seekTo(serverTime);
-    }
+      // Sync time (increased tolerance from 2s to 3s for remote users)
+      const localTime = player.getCurrentTime();
+      if (Math.abs(localTime - serverTime) > 3) {
+        player.seekTo(serverTime);
+      }
+    }, 300); // 300ms debounce
+
+    return () => {
+      if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+    };
   }, [roomState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ─── Player time update callback ────────────── */
@@ -102,7 +137,31 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
     socket.emit("song-ended");
   }, []);
 
-  /* ─── Controls ───────────────────────────────── */
+  /* ─── Audio fix: handle YouTube state changes ── */
+  const handlePlayerStateChange = useCallback((ytState) => {
+    // YT states: -1=unstarted, 0=ended, 1=playing, 2=paused, 3=buffering, 5=cued
+    if (ytState === 1 || ytState === 2) {
+      // Video is now playing or paused → it's loaded, clear the lock
+      if (isLoadingVideoRef.current) {
+        isLoadingVideoRef.current = false;
+        syncLockRef.current = false;
+        if (syncTimeoutRef.current) clearTimeout(syncTimeoutRef.current);
+      }
+    } else if (ytState === -1) {
+      // Error or unstarted — also clear lock to prevent permanent deadlock
+      isLoadingVideoRef.current = false;
+      syncLockRef.current = false;
+    }
+  }, []);
+
+  /* ─── Chat ───────────────────────────────────── */
+  const handleSendMessage = useCallback((text) => {
+    socket.emit("send-message", { text });
+  }, []);
+
+  const clearUnread = useCallback(() => {
+    setUnreadCount(0);
+  }, []);
   const handlePlayPause = () => {
     if (!currentSong) return;
     const time = playerRef.current?.getCurrentTime() || 0;
@@ -189,6 +248,7 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
         ref={playerRef}
         onEnded={handleSongEnded}
         onTimeUpdate={handleTimeUpdate}
+        onStateChange={handlePlayerStateChange}
       />
 
       {/* ── TOP BAR ─────────────────────────────── */}
@@ -253,6 +313,23 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
               {users.length >= 2 ? "In Sync" : "Waiting…"}
             </span>
           </div>
+
+          {/* Chat toggle (desktop) */}
+          <button
+            onClick={() => {
+              setShowChatDesktop((v) => !v);
+              if (!showChatDesktop) clearUnread();
+            }}
+            className={`chat-toggle-btn hidden md:flex ${showChatDesktop ? "active" : ""}`}
+            title="Toggle chat"
+          >
+            <span className="material-symbols-outlined text-[20px]">
+              chat_bubble
+            </span>
+            {unreadCount > 0 && (
+              <div className="chat-unread-badge">{unreadCount > 9 ? "9+" : unreadCount}</div>
+            )}
+          </button>
         </div>
       </nav>
 
@@ -524,10 +601,37 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
             )}
           </div>
         </section>
+
+        {/* ── CHAT SECTION (Mobile, visible when tab = 'chat') ── */}
+        <section
+          className={`mt-8 max-w-lg mx-auto ${
+            activeTab !== "chat" ? "hidden" : ""
+          } md:hidden`}
+          style={{ height: "calc(100vh - 200px)" }}
+        >
+          <ChatPanel
+            messages={chatMessages}
+            userName={userName}
+            onSend={handleSendMessage}
+            socketId={socket.id}
+          />
+        </section>
       </main>
 
+      {/* ── DESKTOP CHAT SIDE PANEL ────────────────── */}
+      {showChatDesktop && (
+        <div className="chat-side-panel hidden md:flex flex-col pt-[72px]">
+          <ChatPanel
+            messages={chatMessages}
+            userName={userName}
+            onSend={handleSendMessage}
+            socketId={socket.id}
+          />
+        </div>
+      )}
+
       {/* ── BOTTOM NAV (Mobile) ─────────────────── */}
-      <nav className="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center px-12 pb-8 pt-4 bg-slate-950/60 backdrop-blur-2xl rounded-t-[40px] shadow-[0_-10px_40px_rgba(233,30,140,0.1)] md:hidden">
+      <nav className="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center px-8 pb-8 pt-4 bg-slate-950/60 backdrop-blur-2xl rounded-t-[40px] shadow-[0_-10px_40px_rgba(233,30,140,0.1)] md:hidden">
         <button
           onClick={() => setActiveTab("playing")}
           className={`flex flex-col items-center justify-center transition-all duration-300 ${
@@ -546,7 +650,7 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
             music_note
           </span>
           <span className="font-headline text-[10px] font-semibold uppercase tracking-widest mt-1">
-            Now Playing
+            Playing
           </span>
           {activeTab === "playing" && (
             <div className="w-1 h-1 bg-pink-500 rounded-full mt-1" />
@@ -574,6 +678,36 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
           </span>
           {activeTab === "queue" && (
             <div className="w-1 h-1 bg-pink-500 rounded-full mt-1" />
+          )}
+        </button>
+        <button
+          onClick={() => {
+            setActiveTab("chat");
+            clearUnread();
+          }}
+          className={`flex flex-col items-center justify-center transition-all duration-300 relative ${
+            activeTab === "chat"
+              ? "text-pink-500 scale-110"
+              : "text-slate-500 hover:text-slate-200"
+          }`}
+        >
+          <span
+            className="material-symbols-outlined"
+            style={{
+              fontVariationSettings:
+                activeTab === "chat" ? "'FILL' 1" : "'FILL' 0",
+            }}
+          >
+            chat_bubble
+          </span>
+          <span className="font-headline text-[10px] font-semibold uppercase tracking-widest mt-1">
+            Chat
+          </span>
+          {activeTab === "chat" && (
+            <div className="w-1 h-1 bg-pink-500 rounded-full mt-1" />
+          )}
+          {activeTab !== "chat" && unreadCount > 0 && (
+            <div className="chat-unread-badge">{unreadCount > 9 ? "9+" : unreadCount}</div>
           )}
         </button>
       </nav>

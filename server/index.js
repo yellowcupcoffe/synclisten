@@ -60,6 +60,8 @@ const rooms = new Map();
  * @property {number}      lastSyncAt    - Date.now() of the last time currentTime was updated
  */
 
+const MAX_MESSAGES = 100;
+
 function createRoom(code) {
   return {
     code,
@@ -69,6 +71,7 @@ function createRoom(code) {
     isPlaying: false,
     currentTime: 0,
     lastSyncAt: Date.now(),
+    messages: [],
   };
 }
 
@@ -92,6 +95,7 @@ function broadcastRoomState(roomCode) {
     isPlaying: room.isPlaying,
     currentTime: getEstimatedTime(room),
     currentSong: room.currentIndex >= 0 ? room.queue[room.currentIndex] : null,
+    messages: room.messages,
   };
 
   io.to(roomCode).emit("room-state", state);
@@ -192,6 +196,19 @@ io.on("connection", (socket) => {
     }
 
     io.to(roomCode).emit("user-joined", { name: name || "Guest", id: socket.id });
+
+    // System message for chat
+    const joinMsg = {
+      id: `msg-${Date.now()}-sys`,
+      sender: "system",
+      senderId: "system",
+      text: `${name || "Guest"} joined the session ✦`,
+      timestamp: Date.now(),
+      type: "system",
+    };
+    room.messages.push(joinMsg);
+    io.to(roomCode).emit("new-message", joinMsg);
+
     broadcastRoomState(roomCode);
   });
 
@@ -381,6 +398,31 @@ io.on("connection", (socket) => {
     // more sophisticated sync in the future
   });
 
+  // ── Chat: send message ────────────────────────────────────
+  socket.on("send-message", ({ text }) => {
+    const room = findRoomBySocket(socket.id);
+    if (!room) return;
+    if (!text || typeof text !== "string" || !text.trim()) return;
+
+    const user = room.users.find((u) => u.socketId === socket.id);
+    const message = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      sender: user?.name || "Guest",
+      senderId: socket.id,
+      text: text.trim().slice(0, 500), // cap at 500 chars
+      timestamp: Date.now(),
+      type: "user",
+    };
+
+    room.messages.push(message);
+    // Cap messages to prevent memory bloat
+    if (room.messages.length > MAX_MESSAGES) {
+      room.messages = room.messages.slice(-MAX_MESSAGES);
+    }
+
+    io.to(room.code).emit("new-message", message);
+  });
+
   // ── Disconnect ────────────────────────────────────────────
   socket.on("disconnect", () => {
     console.log(`✦ Disconnected: ${socket.id}`);
@@ -395,6 +437,18 @@ io.on("connection", (socket) => {
       name: user?.name || "Guest",
       id: socket.id,
     });
+
+    // System message for chat
+    const leaveMsg = {
+      id: `msg-${Date.now()}-sys`,
+      sender: "system",
+      senderId: "system",
+      text: `${user?.name || "Guest"} left the session`,
+      timestamp: Date.now(),
+      type: "system",
+    };
+    room.messages.push(leaveMsg);
+    io.to(room.code).emit("new-message", leaveMsg);
 
     // If room is empty, clean up after a delay (give time to reconnect)
     if (room.users.length === 0) {

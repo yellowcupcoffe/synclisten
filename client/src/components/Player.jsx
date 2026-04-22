@@ -4,8 +4,9 @@ import { useEffect, useRef, useImperativeHandle, forwardRef, useState } from "re
  * Hidden YouTube iFrame player.
  * Exposes imperative methods: loadVideo, play, pause, seekTo, getCurrentTime, getDuration.
  * Fires onEnded callback when a video finishes playing.
+ * Fires onStateChange callback with YT state codes so parent can track buffering→playing transitions.
  */
-const Player = forwardRef(function Player({ onEnded, onReady, onTimeUpdate }, ref) {
+const Player = forwardRef(function Player({ onEnded, onReady, onTimeUpdate, onStateChange }, ref) {
   const containerRef = useRef(null);
   const playerRef = useRef(null);
   const [ready, setReady] = useState(false);
@@ -39,6 +40,8 @@ const Player = forwardRef(function Player({ onEnded, onReady, onTimeUpdate }, re
             }
           },
           onStateChange: (e) => {
+            // Notify parent of all state changes
+            onStateChange?.(e.data);
             // 0 = ENDED
             if (e.data === 0) {
               onEnded?.();
@@ -46,6 +49,8 @@ const Player = forwardRef(function Player({ onEnded, onReady, onTimeUpdate }, re
           },
           onError: (e) => {
             console.error("YT Player error:", e.data);
+            // Notify parent so it can clear the loading lock
+            onStateChange?.(-1);
           },
         },
       });
