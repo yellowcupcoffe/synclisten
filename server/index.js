@@ -372,6 +372,20 @@ io.on("connection", (socket) => {
     broadcastRoomState(room.code);
   });
 
+  // ── Play specific song (click-to-play from queue) ─────────
+  socket.on("play-song", ({ index }) => {
+    const room = findRoomBySocket(socket.id);
+    if (!room) return;
+    if (typeof index !== "number" || index < 0 || index >= room.queue.length) return;
+
+    room.currentIndex = index;
+    room.currentTime = 0;
+    room.isPlaying = true;
+    room.lastSyncAt = Date.now();
+
+    broadcastRoomState(room.code);
+  });
+
   // ── Song ended (auto-advance) ─────────────────────────────
   socket.on("song-ended", () => {
     const room = findRoomBySocket(socket.id);

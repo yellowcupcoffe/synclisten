@@ -21,12 +21,14 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
   const [chatMessages, setChatMessages] = useState([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [showChatDesktop, setShowChatDesktop] = useState(false);
+  const [connectedSocketId, setConnectedSocketId] = useState(socket.id || null);
 
   const playerRef = useRef(null);
   const lastVideoIdRef = useRef(null);
   const syncLockRef = useRef(false); // prevent sync loops
   const isLoadingVideoRef = useRef(false); // audio fix: guard during video load
   const syncTimeoutRef = useRef(null); // audio fix: debounce sync
+  const chatLoadedRef = useRef(false); // track if initial messages were loaded
 
   /* ─── Derived ────────────────────────────────── */
   const currentSong = roomState?.currentSong || null;
@@ -36,12 +38,28 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
   const myUser = users.find((u) => u.id === socket.id);
   const partnerUser = users.find((u) => u.id !== socket.id);
 
+  /* ─── Track socket.id reactively ───────────────── */
+  useEffect(() => {
+    const onConnect = () => setConnectedSocketId(socket.id);
+    socket.on("connect", onConnect);
+    // If already connected, set immediately
+    if (socket.connected) setConnectedSocketId(socket.id);
+    return () => socket.off("connect", onConnect);
+  }, []);
+
+  /* ─── Refs for latest tab/chat state (avoids stale closures) ── */
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const showChatDesktopRef = useRef(showChatDesktop);
+  showChatDesktopRef.current = showChatDesktop;
+
   /* ─── Socket Events ──────────────────────────── */
   useEffect(() => {
     const handleRoomState = (state) => {
       setRoomState(state);
       // Load initial messages from room state (for late joiners)
-      if (state.messages && chatMessages.length === 0) {
+      if (state.messages && !chatLoadedRef.current) {
+        chatLoadedRef.current = true;
         setChatMessages(state.messages);
       }
     };
@@ -49,7 +67,7 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
     const handleNewMessage = (msg) => {
       setChatMessages((prev) => [...prev, msg]);
       // Count unread if not on chat tab (mobile) or chat panel closed (desktop)
-      if (activeTab !== "chat" && !showChatDesktop) {
+      if (activeTabRef.current !== "chat" && !showChatDesktopRef.current) {
         setUnreadCount((c) => c + 1);
       }
     };
@@ -60,7 +78,7 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
       socket.off("room-state", handleRoomState);
       socket.off("new-message", handleNewMessage);
     };
-  }, [activeTab, showChatDesktop]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // stable: no deps needed, uses refs for latest values
 
   /* ─── Sync player with server state (FIXED) ──── */
   useEffect(() => {
@@ -174,6 +192,11 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
 
   const handleSkip = () => socket.emit("skip");
   const handlePrevious = () => socket.emit("previous");
+
+  /* ─── Play specific song from queue ─────────── */
+  const handlePlaySong = (index) => {
+    socket.emit("play-song", { index });
+  };
 
   const handleSeek = (e) => {
     if (!playerDuration) return;
@@ -510,7 +533,8 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
               return (
                 <div
                   key={song.id}
-                  className={`queue-item-enter flex items-center gap-4 p-3 rounded-2xl transition-colors group ${
+                  onClick={() => handlePlaySong(idx)}
+                  className={`queue-item-enter flex items-center gap-4 p-3 rounded-2xl transition-colors group cursor-pointer ${
                     isCurrent
                       ? "bg-surface-container-high border-l-[3px] border-primary-container"
                       : "bg-surface-container-low hover:bg-surface-container-high"
@@ -613,7 +637,7 @@ export default function RoomScreen({ userName, roomCode, onLeave }) {
             messages={chatMessages}
             userName={userName}
             onSend={handleSendMessage}
-            socketId={socket.id}
+            socketId={connectedSocketId}
           />
         </section>
       </main>
